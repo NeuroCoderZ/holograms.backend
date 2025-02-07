@@ -78,14 +78,29 @@ io.on('connection', (socket) => {
         const { initData } = data;
 
         if (checkSignature(initData, botToken)) {
-            const user = JSON.parse(decodeURIComponent(initData.user));
-            const userId = user.id;
-            socket.userId = userId;
-            console.log(`Пользователь ${userId} успешно аутентифицирован.`);
-            socket.emit('auth-success', { userId: userId });
+            try { // Добавляем try...catch
+                const initDataParams = new URLSearchParams(initData);
+                if(Date.now()/1000 - initDataParams.get('auth_date') > 86400)
+                {
+                    //initData устарела, более суток.
+                     console.log('Ошибка аутентификации: initData устарела.');
+                     socket.emit('auth-failed', {message: 'Authentication failed: initData expired.'});
+                     socket.disconnect(true);
+                     return;
+                }
+                const user = JSON.parse(decodeURIComponent(initDataParams.get('user')));
+                const userId = user.id;
+                socket.userId = userId; //  Рассмотрите более безопасный способ хранения
+                console.log(`Пользователь ${userId} успешно аутентифицирован.`);
+                socket.emit('auth-success', { userId: userId });
+            } catch (error) { // Обрабатываем ошибки парсинга
+                console.error('Authentication error (parsing):', error);
+                socket.emit('auth-failed', { message: 'Authentication failed: invalid user data.' });
+                socket.disconnect(true);
+            }
         } else {
             console.log('Ошибка аутентификации.');
-            socket.emit('auth-failed');
+            socket.emit('auth-failed', { message: 'Authentication failed: invalid signature.' });
             socket.disconnect(true);
         }
     });
@@ -117,15 +132,37 @@ io.on('connection', (socket) => {
 
      // Пример сохранения жеста в MongoDB (нужно адаптировать под вашу структуру данных)
       async function saveGesture() {
-        try {
-          const db = client.db("holograms"); //  Имя вашей базы данных
-          const gestures = db.collection("gestures"); //  Имя коллекции
-          await gestures.insertOne(gestureData);
-          console.log("Gesture saved to MongoDB");
-        } catch (err) {
-          console.error("Error saving gesture to MongoDB:", err);
-           //  Отправьте сообщение об ошибке клиенту, если нужно
-           socket.emit('gesture-save-error', { error: err.message });
+        const MAX_RETRIES = 3;
+        const RETRY_DELAY = 1000; // ms
+
+        for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+          try {
+            const db = client.db("holograms");
+            const gestures = db.collection("gestures");
+            await gestures.insertOne(gestureData);
+            console.log("Gesture saved to MongoDB");
+            return; // Success! Exit the loop.
+          } catch (err) {
+            console.error(`Error saving gesture (attempt ${attempt}):`, err);
+
+            if (attempt === MAX_RETRIES) {
+              console.error("Max retries reached. Giving up.");
+              socket.emit('gesture-save-error', { error: 'Failed to save gesture after multiple retries.' });
+              return;
+            }
+
+            // Check if the error is likely to be temporary.  This is a simplified example,
+            // and you might need to check for more specific error codes/messages.
+            if (err.name === 'MongoNetworkError' || err.message.includes('timed out')) {
+              console.log(`Temporary error. Retrying in ${RETRY_DELAY}ms...`);
+              await new Promise(resolve => setTimeout(resolve, RETRY_DELAY));
+            } else {
+              // Permanent error.  Don't retry.
+              console.error("Permanent error.  Giving up.");
+              socket.emit('gesture-save-error', { error: err.message });
+              return;
+            }
+          }
         }
       }
       saveGesture();
